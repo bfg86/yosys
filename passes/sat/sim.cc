@@ -22,6 +22,7 @@
 #include "kernel/celltypes.h"
 #include "kernel/mem.h"
 #include "kernel/fstdata.h"
+#include "kernel/ff.h"
 
 #include <ctime>
 
@@ -76,6 +77,7 @@ struct SimShared
 	double stop_time = -1;
 	SimulationMode sim_mode = SimulationMode::sim;
 	bool cycles_set = false;
+	const pool<IdString> ff_types = RTLIL::builtin_ff_cell_types();
 };
 
 void zinit(State &v)
@@ -113,8 +115,11 @@ struct SimInstance
 
 	struct ff_state_t
 	{
-		State past_clock;
 		Const past_d;
+		Const past_ad;
+		SigSpec past_clk;
+		
+		FfData data;
 	};
 
 	struct mem_state_t
@@ -209,10 +214,13 @@ struct SimInstance
 					}
 			}
 
-			if (cell->type.in(ID($dff))) {
+			if (shared->ff_types.count(cell->type)) {
+				FfData ff_data(nullptr, cell);
 				ff_state_t ff;
-				ff.past_clock = State::Sx;
-				ff.past_d = Const(State::Sx, cell->getParam(ID::WIDTH).as_int());
+				ff.past_d = Const(State::Sx, ff_data.width);
+				ff.past_ad = Const(State::Sx, ff_data.width);
+				ff.past_clk = State::Sx;
+				ff.data = ff_data;
 				ff_database[cell] = ff;
 			}
 
@@ -229,11 +237,10 @@ struct SimInstance
 		{
 			for (auto &it : ff_database)
 			{
-				Cell *cell = it.first;
 				ff_state_t &ff = it.second;
 				zinit(ff.past_d);
 
-				SigSpec qsig = cell->getPort(ID::Q);
+				SigSpec qsig = it.second.data.sig_q;
 				Const qdata = get_state(qsig);
 				zinit(qdata);
 				set_state(qsig, qdata);
@@ -466,20 +473,117 @@ struct SimInstance
 
 		for (auto &it : ff_database)
 		{
-			Cell *cell = it.first;
 			ff_state_t &ff = it.second;
+			FfData ff_data = ff.data;
 
-			if (cell->type.in(ID($dff)))
-			{
-				bool clkpol = cell->getParam(ID::CLK_POLARITY).as_bool();
-				State current_clock = get_state(cell->getPort(ID::CLK))[0];
+			if (ff_data.has_clk) {
+				// flip-flops
+				State current_clk = get_state(ff_data.sig_clk)[0];
 
-				if (clkpol ? (ff.past_clock == State::S1 || current_clock != State::S1) :
-						(ff.past_clock == State::S0 || current_clock != State::S0))
+				// handle set/reset
+				if (ff.data.has_sr) {
+					Const current_q = get_state(ff.data.sig_q);
+					Const current_clr = get_state(ff.data.sig_clr);
+					Const current_set = get_state(ff.data.sig_set);
+
+					for(int i=0;i<ff.past_d.size();i++) {
+						
+						if (current_clr[i] == (ff_data.pol_clr ? State::S1 : State::S0)) {
+							current_q[i] = State::S0;
+						}
+						else if (current_set[i] == (ff_data.pol_set ? State::S1 : State::S0)) {
+							current_q[i] = State::S1;
+						} else {
+							// all below is in sync with clk
+							if (ff_data.pol_clk ? (ff.past_clk == State::S1 || current_clk != State::S1) :
+									(ff.past_clk == State::S0 || current_clk != State::S0))
+								continue;
+
+							if (ff_data.has_ce) {
+								State current_ce = get_state(ff_data.sig_ce)[0];
+								if (current_ce == (ff_data.pol_ce ? State::S1 : State::S0))
+									current_q[i] = ff.past_d[i];
+							} else {
+								current_q[i] = ff.past_d[i];
+							}
+						}
+					}
+					if (set_state(ff_data.sig_q, current_q))
+						did_something = true;
+					continue;
+				}
+
+				// async reset
+				if (ff_data.has_arst) {
+					State current_arst = get_state(ff_data.sig_arst)[0];
+					if (current_arst == (ff_data.pol_arst ? State::S1 : State::S0)) {
+						if (set_state(ff_data.sig_q, ff_data.val_arst))
+							did_something = true;
+						continue;
+					}
+				}
+				// async load
+				if (ff_data.has_aload) {
+					State current_aload = get_state(ff_data.sig_aload)[0];
+					if (current_aload == (ff_data.pol_aload ? State::S1 : State::S0)) {
+						if (set_state(ff_data.sig_q, ff.past_ad))
+							did_something = true;
+						continue;
+					}
+				}
+
+				// all below is in sync with clk
+				if (ff_data.pol_clk ? (ff.past_clk == State::S1 || current_clk != State::S1) :
+						(ff.past_clk == State::S0 || current_clk != State::S0))
 					continue;
 
-				if (set_state(cell->getPort(ID::Q), ff.past_d))
+				// chip enable priority over reset
+				if (ff_data.ce_over_srst && ff_data.has_ce) {
+					State current_ce = get_state(ff_data.sig_ce)[0];
+					if (current_ce != (ff_data.pol_ce ? State::S1 : State::S0))
+						continue;
+				}
+				
+				// handle sync reset
+				if (ff_data.has_srst) {
+					State current_srst = get_state(ff_data.sig_srst)[0];
+					if (current_srst == (ff_data.pol_srst ? State::S1 : State::S0)) {
+						if (set_state(ff_data.sig_q, ff_data.val_srst))
+							did_something = true;
+						continue;
+					}
+				}
+
+				// reset had priority over chip enable
+				if (!ff_data.ce_over_srst && ff_data.has_ce) {
+					State current_ce = get_state(ff_data.sig_ce)[0];
+					if (current_ce != (ff_data.pol_ce ? State::S1 : State::S0))
+						continue;
+				}
+				if (set_state(ff_data.sig_q, ff.past_d))
 					did_something = true;
+			} else {
+				// latches
+
+				// async reset
+				if (ff_data.has_arst) {
+					State current_arst = get_state(ff_data.sig_arst)[0];
+					if (current_arst == (ff_data.pol_arst ? State::S1 : State::S0)) {
+						if (set_state(ff_data.sig_q, ff_data.val_arst))
+							did_something = true;
+						continue;
+					}
+				}
+
+				// async load is true for all latches
+				if (ff_data.has_aload) {
+					State current_aload = get_state(ff_data.sig_aload)[0];
+					if (current_aload == (ff_data.pol_aload ? State::S1 : State::S0)) {
+						if (set_state(ff_data.sig_q, get_state(ff.data.sig_ad)))
+							did_something = true;
+						continue;
+					}
+				}
 			}
 		}
 
@@ -534,16 +638,20 @@ struct SimInstance
 		return did_something;
 	}
 
-	void update_ph3()
+	void update_ph3(bool top_only)
 	{
 		for (auto &it : ff_database)
 		{
-			Cell *cell = it.first;
 			ff_state_t &ff = it.second;
 
-			if (cell->type.in(ID($dff))) {
-				ff.past_clock = get_state(cell->getPort(ID::CLK))[0];
-				ff.past_d = get_state(cell->getPort(ID::D));
+			if (ff.data.has_aload) {
+				ff.past_ad = get_state(ff.data.sig_ad);
+			}
+			if (ff.data.has_clk) {
+				ff.past_d = get_state(ff.data.sig_d);
+				if (!top_only) {
+					ff.past_clk = get_state(ff.data.sig_clk)[0];
+				}
 			}
 		}
 
@@ -559,6 +667,7 @@ struct SimInstance
 				mem.past_wr_data[i] = get_state(port.data);
 			}
 		}
+		if (top_only) return;
 
 		for (auto cell : formal_database)
 		{
@@ -580,7 +689,7 @@ struct SimInstance
 		}
 
 		for (auto it : children)
-			it.second->update_ph3();
+			it.second->update_ph3(false);
 	}
 
 	void writeback(pool<Module*> &wbmods)
@@ -595,8 +704,7 @@ struct SimInstance
 
 		for (auto &it : ff_database)
 		{
-			Cell *cell = it.first;
-			SigSpec sig_q = cell->getPort(ID::Q);
+			SigSpec sig_q = it.second.data.sig_q;
 			Const initval = get_state(sig_q);
 
 			for (int i = 0; i < GetSize(sig_q); i++)
@@ -726,9 +834,7 @@ struct SimInstance
 	{
 		for (auto &it : ff_database)
 		{
-			Cell *cell = it.first;
-			
-			SigSpec qsig = cell->getPort(ID::Q);
+			SigSpec qsig = it.second.data.sig_q;
 			if (qsig.is_wire()) {
 				IdString name = qsig.as_wire()->name;
 				fstHandle id = shared->fst->getHandle(scope + "." + RTLIL::unescape_id(name));
@@ -886,7 +992,7 @@ struct SimWorker : SimShared
 		if (debug)
 			log("\n-- ph3 --\n");
 
-		top->update_ph3();
+		top->update_ph3(false);
 	}
 
 	void set_inports(pool<IdString> ports, State value)
@@ -1064,17 +1170,23 @@ struct SimWorker : SimShared
 				std::string v = fst->valueAt(item.second, time);
 				top->set_state(item.first, Const::from_string(v));
 			}
+			top->update_ph3(true);
 			if (initial) {
 				top->setInitState(time);
+				write_output_header();
 				initial = false;
 			}
 			update();
+			write_output_step(5*cycle);
 
 			bool status = top->checkSignals(time);
 			if (status)
 				log_error("Signal difference\n");
 			cycle++;
 		}
+		write_output_step(5*(cycle-1)+2);
+		write_output_end();
+
 		if (writeback) {
 			pool<Module*> wbmods;
 			top->writeback(wbmods);
