@@ -1,5 +1,5 @@
-module dffe( input clk, en, output reg q );
+module dffe( input clk, en, d, output reg q );
 	always @( posedge clk )
 		if ( en )
-			q <= ~q;
+			q <= d;
 endmodule

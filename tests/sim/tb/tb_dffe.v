@@ -2,12 +2,16 @@
 module tb_dffe();
 	reg clk = 0;
 	reg en = 0;
+	reg d = 0;
 	wire q;
 
-	dffe uut(.clk(clk),.en(en),.q(q));
+	dffe uut(.clk(clk),.d(d),.en(en),.q(q));
 
 	always
 		#(5) clk <= !clk;
+
+	always
+		#(3) d <= !d;
 
 	initial
 	begin

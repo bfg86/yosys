@@ -11,7 +11,7 @@ module tb_sdff();
 		#(5) clk <= !clk;
 
 	always
-		#(10) d <= !d;
+		#(3) d <= !d;
 
 	initial
 	begin

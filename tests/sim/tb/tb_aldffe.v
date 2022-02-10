@@ -12,6 +12,9 @@ module tb_aldffe();
 	always
 		#(5) clk <= !clk;
 
+	always
+		#(3) d <= !d;
+
 	initial
 	begin
 		$dumpfile("tb_aldffe");

@@ -2,12 +2,16 @@
 module tb_dlatch();
 	reg clk = 0;
 	reg en = 0;
+	reg d = 0;
 	wire q;
 
-	dlatch uut(.d(clk),.en(en),.q(q));
+	dlatch uut(.d(d),.en(en),.q(q));
 
 	always
 		#(5) clk <= !clk;
+
+	always
+		#(3) d <= !d;
 
 	initial
 	begin
